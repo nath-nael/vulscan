@@ -1,312 +1,293 @@
+import requests
 import re
-import json
-from urllib.parse import urljoin
-from .utils import safe_request
+from urllib.parse import urlparse
+from .utils import get_headers
 
-class InfoLeakageScanner:
-    def __init__(self):
-        self.vulnerabilities = []
+# Patterns for sensitive information
+SENSITIVE_PATTERNS = {
+    "Email Address": r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+',
+    "IP Address": r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
+    "AWS Access Key": r'AKIA[0-9A-Z]{16}',
+    "AWS Secret Key": r'(?i)aws(.{0,20})?secret(.{0,20})?[\'"\s:=]+([A-Za-z0-9/+=]{40})',
+    "Private Key Block": r'-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----',
+    "Google API Key": r'AIza[0-9A-Za-z\-_]{35}',
+    "GitHub Token": r'ghp_[0-9a-zA-Z]{36}',
+    "JWT Token": r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
+    "Basic Auth in URL": r'https?://[^:]+:[^@]+@',
+    "Phone Number": r'\b(\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b',
+    "Credit Card": r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b',
+    "Password in HTML": r'(?i)(password|passwd|pwd)\s*[=:]\s*[\'"]?[^\s\'"]{4,}',
+    "Internal Path": r'(?i)(\/home\/|\/var\/|\/etc\/|C:\\Users\\|C:\\Windows\\)',
+    "Stack Trace": r'(?i)(traceback|stack trace|at [a-zA-Z0-9_.]+\([a-zA-Z0-9_.]+\.java:\d+\))',
+    "SQL Error": r'(?i)(sql syntax|mysql_fetch|ORA-\d{5}|sqlite_error|pg_query|SQLSTATE)',
+    "PHP Error": r'(?i)(fatal error|parse error|warning:.*php)',
+    "Debug Info": r'(?i)(debug|var_dump|console\.log|print_r\()',
+    "Version Disclosure": r'(?i)(apache\/\d|nginx\/\d|php\/\d|openssl\/\d|iis\/\d)',
+    "Social Security Number": r'\b\d{3}-\d{2}-\d{4}\b',
+    "Bearer Token": r'(?i)bearer\s+[a-zA-Z0-9\-._~+/]+=*',
+    "API Key Generic": r'(?i)(api[_-]?key|apikey)\s*[=:]\s*[\'"]?[a-zA-Z0-9]{16,}',
+}
 
-        # Sensitive file paths to check
-        self.sensitive_paths = [
-            # Config files
-            '/.env', '/.env.local', '/.env.production', '/.env.development',
-            '/config.php', '/config.js', '/config.json', '/config.yml', '/config.yaml',
-            '/configuration.php', '/settings.py', '/settings.php',
-            '/wp-config.php', '/wp-config.php.bak',
+# Sensitive files to check
+SENSITIVE_FILES = [
+    "/.env",
+    "/.git/config",
+    "/.git/HEAD",
+    "/config.php",
+    "/wp-config.php",
+    "/config.yml",
+    "/config.yaml",
+    "/settings.py",
+    "/database.yml",
+    "/secrets.yml",
+    "/.htpasswd",
+    "/.htaccess",
+    "/web.config",
+    "/phpinfo.php",
+    "/info.php",
+    "/test.php",
+    "/backup.sql",
+    "/dump.sql",
+    "/db.sql",
+    "/admin/config.php",
+    "/composer.json",
+    "/package.json",
+    "/Dockerfile",
+    "/docker-compose.yml",
+    "/.dockerenv",
+    "/proc/self/environ",
+    "/server-status",
+    "/server-info",
+    "/.bash_history",
+    "/.ssh/id_rsa",
+    "/robots.txt",
+    "/sitemap.xml",
+    "/crossdomain.xml",
+    "/clientaccesspolicy.xml",
+    "/.well-known/security.txt",
+    "/error_log",
+    "/access_log",
+    "/debug.log",
+]
 
-            # Backup files
-            '/backup.sql', '/backup.zip', '/backup.tar.gz', '/backup.tar',
-            '/db.sql', '/database.sql', '/dump.sql', '/site.sql',
-            '/backup/', '/backups/', '/bak/',
+# Sensitive response headers
+SENSITIVE_HEADERS = [
+    "X-Powered-By",
+    "Server",
+    "X-AspNet-Version",
+    "X-AspNetMvc-Version",
+    "X-Generator",
+    "X-Drupal-Cache",
+    "X-Varnish",
+    "Via",
+    "X-Backend-Server",
+    "X-CF-Powered-By",
+]
 
-            # Version control
-            '/.git/HEAD', '/.git/config', '/.git/COMMIT_EDITMSG',
-            '/.svn/entries', '/.hg/hgrc',
-            '/.gitignore', '/.gitattributes',
 
-            # Admin panels
-            '/admin', '/admin/', '/administrator', '/admin/login',
-            '/wp-admin', '/wp-login.php', '/phpmyadmin', '/pma',
-            '/cpanel', '/webmail', '/plesk',
+def scan_page_content(url: str, html_content: str) -> list:
+    """Scan page HTML content for sensitive information patterns."""
+    findings = []
 
-            # Log files
-            '/error.log', '/access.log', '/debug.log', '/app.log',
-            '/logs/', '/log/', '/error_log', '/php_error.log',
+    for pattern_name, pattern in SENSITIVE_PATTERNS.items():
+        matches = re.findall(pattern, html_content)
+        if matches:
+            unique_matches = list(set(
+                [m if isinstance(m, str) else m[0] for m in matches]
+            ))[:5]  # Limit to 5 examples
+            findings.append({
+                "type": "Info Leakage - Content",
+                "severity": _get_severity(pattern_name),
+                "url": url,
+                "detail": f"Pattern '{pattern_name}' found in page content.",
+                "evidence": f"Matches (up to 5): {unique_matches}",
+                "recommendation": f"Remove or mask sensitive data matching '{pattern_name}' from public-facing pages."
+            })
 
-            # API docs
-            '/api', '/api/v1', '/api/v2', '/swagger', '/swagger.json',
-            '/swagger-ui.html', '/api-docs', '/openapi.json', '/graphql',
+    return findings
 
-            # Common sensitive files
-            '/robots.txt', '/sitemap.xml', '/crossdomain.xml',
-            '/phpinfo.php', '/info.php', '/test.php', '/php.php',
-            '/server-status', '/server-info', '/.htaccess', '/.htpasswd',
-            '/web.config', '/app.config',
 
-            # Package files
-            '/package.json', '/composer.json', '/requirements.txt',
-            '/Gemfile', '/Pipfile', '/yarn.lock', '/package-lock.json',
+def scan_sensitive_files(base_url: str, session: requests.Session = None) -> list:
+    """Check for exposed sensitive files."""
+    findings = []
+    parsed = urlparse(base_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
 
-            # Docker/CI files
-            '/Dockerfile', '/docker-compose.yml', '/.travis.yml',
-            '/Jenkinsfile', '/.circleci/config.yml',
+    sess = session or requests.Session()
 
-            # AWS/Cloud
-            '/.aws/credentials', '/aws.json',
-
-            # SSH keys
-            '/.ssh/id_rsa', '/.ssh/id_rsa.pub', '/.ssh/authorized_keys',
-
-            # Certificate files
-            '/server.key', '/server.crt', '/ssl.key',
-
-            # Common CMS
-            '/readme.html', '/readme.txt', '/README.md', '/CHANGELOG.md',
-            '/license.txt', '/LICENSE',
-
-            # Exposed directories
-            '/uploads/', '/upload/', '/files/', '/file/', '/media/',
-            '/static/', '/assets/', '/public/',
-        ]
-
-        # Sensitive data patterns
-        self.sensitive_patterns = {
-            'AWS Access Key': r'AKIA[0-9A-Z]{16}',
-            'AWS Secret Key': r'[0-9a-zA-Z/+]{40}',
-            'Google API Key': r'AIza[0-9A-Za-z\-_]{35}',
-            'Google OAuth': r'[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com',
-            'GitHub Token': r'ghp_[0-9a-zA-Z]{36}',
-            'GitHub OAuth': r'gho_[0-9a-zA-Z]{36}',
-            'Stripe API Key': r'sk_live_[0-9a-zA-Z]{24}',
-            'Stripe Publishable Key': r'pk_live_[0-9a-zA-Z]{24}',
-            'Twilio API Key': r'SK[0-9a-fA-F]{32}',
-            'SendGrid API Key': r'SG\.[0-9A-Za-z\-_]{22}\.[0-9A-Za-z\-_]{43}',
-            'Mailgun API Key': r'key-[0-9a-zA-Z]{32}',
-            'PayPal Client ID': r'A[0-9a-zA-Z]{79}',
-            'RSA Private Key': r'-----BEGIN RSA PRIVATE KEY-----',
-            'DSA Private Key': r'-----BEGIN DSA PRIVATE KEY-----',
-            'EC Private Key': r'-----BEGIN EC PRIVATE KEY-----',
-            'PGP Private Key': r'-----BEGIN PGP PRIVATE KEY BLOCK-----',
-            'SSH Private Key': r'-----BEGIN OPENSSH PRIVATE KEY-----',
-            'JWT Token': r'eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*',
-            'Basic Auth': r'Authorization:\s*Basic\s+[A-Za-z0-9+/=]+',
-            'Bearer Token': r'Authorization:\s*Bearer\s+[A-Za-z0-9\-._~+/]+=*',
-            'Database URL': r'(mysql|postgresql|mongodb|redis):\/\/[^\s"\']+',
-            'Password in URL': r'[?&]password=[^&\s]+',
-            'Password in Code': r'password\s*=\s*["\'][^"\']{3,}["\']',
-            'Secret in Code': r'secret\s*=\s*["\'][^"\']{3,}["\']',
-            'API Key in Code': r'api_key\s*=\s*["\'][^"\']{3,}["\']',
-            'Private Key in Code': r'private_key\s*=\s*["\'][^"\']{3,}["\']',
-            'Internal IP': r'\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b',
-            'Email Address': r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
-            'Credit Card': r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12})\b',
-            'SSN': r'\b\d{3}-\d{2}-\d{4}\b',
-            'Phone Number': r'\b[\+]?[(]?[0-9]{3}[)]?[-\s\.]?[0-9]{3}[-\s\.]?[0-9]{4,6}\b',
-        }
-
-        # Technology fingerprints
-        self.tech_fingerprints = {
-            'WordPress': [r'wp-content', r'wp-includes', r'WordPress'],
-            'Drupal': [r'Drupal', r'/sites/default/', r'drupal.js'],
-            'Joomla': [r'Joomla', r'/components/com_', r'joomla'],
-            'Laravel': [r'Laravel', r'laravel_session', r'XSRF-TOKEN'],
-            'Django': [r'Django', r'csrfmiddlewaretoken', r'django'],
-            'Ruby on Rails': [r'Rails', r'_rails_', r'X-Runtime'],
-            'ASP.NET': [r'ASP\.NET', r'__VIEWSTATE', r'__EVENTVALIDATION'],
-            'PHP': [r'\.php', r'PHPSESSID', r'X-Powered-By: PHP'],
-            'Apache': [r'Apache', r'Server: Apache'],
-            'Nginx': [r'nginx', r'Server: nginx'],
-            'IIS': [r'IIS', r'Server: Microsoft-IIS'],
-            'Express.js': [r'Express', r'X-Powered-By: Express'],
-            'React': [r'react', r'__REACT', r'_reactFiber'],
-            'Angular': [r'ng-version', r'angular', r'ng-app'],
-            'Vue.js': [r'vue', r'__vue__', r'v-app'],
-        }
-
-    def scan(self, base_url, crawl_data, progress_callback=None):
-        results = {
-            'exposed_files': [],
-            'sensitive_data': [],
-            'technology_stack': [],
-            'comments_with_info': [],
-            'js_secrets': [],
-            'directory_listing': [],
-            'error_messages': [],
-            'version_disclosure': []
-        }
-
-        # Check for exposed sensitive files
-        if progress_callback:
-            progress_callback("Checking for exposed sensitive files...")
-
-        exposed = self._check_sensitive_files(base_url)
-        results['exposed_files'] = exposed
-
-        # Scan page content for sensitive data
-        if progress_callback:
-            progress_callback("Scanning for sensitive data leakage...")
-
-        for url, page_data in crawl_data.get('page_data', {}).items():
-            sensitive = self._scan_content_for_secrets(page_data.get('html', ''), url)
-            results['sensitive_data'].extend(sensitive)
-
-        # Scan JS files for secrets
-        if progress_callback:
-            progress_callback("Scanning JavaScript files for secrets...")
-
-        for js_url in crawl_data.get('js_files', []):
-            js_secrets = self._scan_js_file(js_url)
-            results['js_secrets'].extend(js_secrets)
-
-        # Analyze HTML comments
-        for comment in crawl_data.get('comments', []):
-            comment_info = self._analyze_comment(comment)
-            if comment_info:
-                results['comments_with_info'].append(comment_info)
-
-        # Detect technology stack
-        if progress_callback:
-            progress_callback("Detecting technology stack...")
-
-        tech_stack = self._detect_tech_stack(crawl_data)
-        results['technology_stack'] = tech_stack
-
-        # Check for version disclosure in headers
-        for url, headers in crawl_data.get('response_headers', {}).items():
-            version_info = self._check_version_disclosure(url, headers)
-            results['version_disclosure'].extend(version_info)
-
-        # Check for directory listing
-        dirs_to_check = ['/uploads/', '/images/', '/files/', '/backup/', '/logs/', '/admin/']
-        for dir_path in dirs_to_check:
-            dir_url = urljoin(base_url, dir_path)
-            dir_vuln = self._check_directory_listing(dir_url)
-            if dir_vuln:
-                results['directory_listing'].append(dir_vuln)
-
-        return results
-
-    def _check_sensitive_files(self, base_url):
-        exposed = []
-
-        for path in self.sensitive_paths:
-            url = urljoin(base_url, path)
-            response = safe_request(url)
-
-            if response and response.status_code == 200:
-                content_preview = response.text[:500] if response.text else ''
-
-                severity = self._get_file_severity(path)
-
-                exposed.append({
-                    'type': 'Exposed Sensitive File',
-                    'severity': severity,
-                    'url': url,
-                    'path': path,
-                    'status_code': response.status_code,
-                    'content_length': len(response.content),
-                    'content_preview': content_preview[:200],
-                    'description': f"Sensitive file accessible: {path}",
-                    'recommendation': f"Restrict access to {path}"
-                })
-
-        return exposed
-
-    def _get_file_severity(self, path):
-        critical_paths = ['.env', '.git', 'config', 'password', 'secret', 
-                         'key', 'credential', 'backup', '.sql', 'id_rsa']
-        high_paths = ['admin', 'phpinfo', 'phpmyadmin', 'wp-config', 'htpasswd']
-
-        path_lower = path.lower()
-        if any(p in path_lower for p in critical_paths):
-            return 'CRITICAL'
-        elif any(p in path_lower for p in high_paths):
-            return 'HIGH'
-        else:
-            return 'MEDIUM'
-
-    def _scan_content_for_secrets(self, content, url):
-        findings = []
-
-        for pattern_name, pattern in self.sensitive_patterns.items():
-            matches = re.findall(pattern, content)
-            if matches:
-                # Filter out false positives
-                unique_matches = list(set(matches))[:5]
-
-                # Determine severity
-                severity = 'HIGH'
-                if pattern_name in ['Email Address', 'Phone Number', 'Internal IP']:
-                    severity = 'LOW'
-                elif pattern_name in ['Credit Card', 'SSN', 'RSA Private Key', 
-                                      'AWS Access Key', 'AWS Secret Key']:
-                    severity = 'CRITICAL'
-
+    for path in SENSITIVE_FILES:
+        target_url = base + path
+        try:
+            resp = sess.get(
+                target_url,
+                headers=get_headers(),
+                timeout=8,
+                allow_redirects=False,
+                verify=False
+            )
+            if resp.status_code == 200 and len(resp.text) > 0:
+                severity = _file_severity(path)
                 findings.append({
-                    'type': f'Sensitive Data: {pattern_name}',
-                    'severity': severity,
-                    'url': url,
-                    'pattern': pattern_name,
-                    'matches': [str(m)[:50] + '...' if len(str(m)) > 50 else str(m) 
-                               for m in unique_matches],
-                    'count': len(matches),
-                    'description': f"{pattern_name} found in page content",
-                    'recommendation': f"Remove or protect {pattern_name} from public access"
+                    "type": "Info Leakage - Sensitive File",
+                    "severity": severity,
+                    "url": target_url,
+                    "detail": f"Sensitive file accessible: {path}",
+                    "evidence": f"HTTP {resp.status_code} | Size: {len(resp.content)} bytes | Snippet: {resp.text[:100].strip()}",
+                    "recommendation": f"Restrict access to '{path}' via server configuration or remove it from the web root."
                 })
+        except requests.RequestException:
+            continue
 
-        return findings
+    return findings
 
-    def _scan_js_file(self, js_url):
-        findings = []
-        response = safe_request(js_url)
 
-        if not response:
-            return findings
+def scan_response_headers(url: str, session: requests.Session = None) -> list:
+    """Check response headers for information disclosure."""
+    findings = []
+    sess = session or requests.Session()
 
-        content = response.text
+    try:
+        resp = sess.get(
+            url,
+            headers=get_headers(),
+            timeout=10,
+            verify=False
+        )
+        response_headers = dict(resp.headers)
 
-        # Scan for secrets in JS
-        js_patterns = {
-            'API Key': r'(?:api[_-]?key|apikey)\s*[:=]\s*["\']([^"\']{10,})["\']',
-            'Secret': r'(?:secret|password|passwd|pwd)\s*[:=]\s*["\']([^"\']{6,})["\']',
-            'Token': r'(?:token|auth)\s*[:=]\s*["\']([^"\']{10,})["\']',
-            'AWS Key': r'AKIA[0-9A-Z]{16}',
-            'Private Key': r'-----BEGIN [A-Z]+ PRIVATE KEY-----',
-            'Database URL': r'(?:mysql|postgresql|mongodb|redis):\/\/[^\s"\']+',
-            'Hardcoded URL': r'https?:\/\/(?:localhost|127\.0\.0\.1|192\.168\.|10\.)[^\s"\']+',
-            'Base64 Secret': r'(?:secret|password|key)\s*[:=]\s*["\']([A-Za-z0-9+/]{20,}={0,2})["\']',
-        }
-
-        for pattern_name, pattern in js_patterns.items():
-            matches = re.findall(pattern, content, re.IGNORECASE)
-            if matches:
+        for header in SENSITIVE_HEADERS:
+            if header.lower() in {k.lower(): v for k, v in response_headers.items()}:
+                value = next(
+                    v for k, v in response_headers.items()
+                    if k.lower() == header.lower()
+                )
                 findings.append({
-                    'type': f'JS Secret: {pattern_name}',
-                    'severity': 'HIGH',
-                    'url': js_url,
-                    'pattern': pattern_name,
-                    'matches': [str(m)[:50] for m in list(set(matches))[:3]],
-                    'description': f"{pattern_name} found in JavaScript file",
-                    'recommendation': 'Move secrets to server-side, never expose in JS'
+                    "type": "Info Leakage - Response Header",
+                    "severity": "Low",
+                    "url": url,
+                    "detail": f"Header '{header}' discloses server information.",
+                    "evidence": f"{header}: {value}",
+                    "recommendation": f"Remove or obscure the '{header}' header in your server configuration."
                 })
 
-        return findings
+        # Check for directory listing hints
+        if "Index of /" in resp.text or "Directory listing" in resp.text:
+            findings.append({
+                "type": "Info Leakage - Directory Listing",
+                "severity": "Medium",
+                "url": url,
+                "detail": "Directory listing appears to be enabled.",
+                "evidence": "Page contains 'Index of /' or 'Directory listing'",
+                "recommendation": "Disable directory listing in your web server configuration."
+            })
 
-    def _analyze_comment(self, comment):
-        content = comment.get('content', '')
+    except requests.RequestException as e:
+        findings.append({
+            "type": "Info Leakage - Error",
+            "severity": "Info",
+            "url": url,
+            "detail": "Could not retrieve response headers.",
+            "evidence": str(e),
+            "recommendation": "Ensure the target URL is accessible."
+        })
 
-        sensitive_keywords = [
-            'password', 'passwd', 'pwd', 'secret', 'key', 'token',
-            'api', 'todo', 'fixme', 'hack', 'bug', 'vulnerability',
-            'admin', 'root', 'debug', 'test', 'temp', 'temporary',
-            'credentials', 'username', 'user', 'login', 'auth',
-            'database', 'db', 'sql', 'server', 'host', 'port',
-            'internal', 'private', 'confidential', 'sensitive'
-        ]
+    return findings
 
-        content_lower = content.lower()
-        found_keywords = [kw for kw in sensitive_keywords if kw in content_lower]
 
-        if found_keywords:
-             ▏
+def scan_comments(url: str, html_content: str) -> list:
+    """Scan HTML comments for sensitive information."""
+    findings = []
+    comment_pattern = re.compile(r'<!--(.*?)-->', re.DOTALL)
+    comments = comment_pattern.findall(html_content)
+
+    sensitive_keywords = [
+        "password", "passwd", "secret", "token", "api_key",
+        "apikey", "todo", "fixme", "hack", "bug", "credentials",
+        "username", "admin", "debug", "test", "private"
+    ]
+
+    for comment in comments:
+        comment_lower = comment.lower()
+        matched_keywords = [kw for kw in sensitive_keywords if kw in comment_lower]
+        if matched_keywords:
+            findings.append({
+                "type": "Info Leakage - HTML Comment",
+                "severity": "Low",
+                "url": url,
+                "detail": f"HTML comment contains sensitive keywords: {matched_keywords}",
+                "evidence": comment.strip()[:200],
+                "recommendation": "Remove sensitive information from HTML comments before deploying to production."
+            })
+
+    return findings
+
+
+def run_info_leakage_scan(urls: list, session: requests.Session = None) -> list:
+    """Run all info leakage checks across discovered URLs."""
+    all_findings = []
+    sess = session or requests.Session()
+
+    if not urls:
+        return all_findings
+
+    # Use first URL as base for sensitive file scanning
+    base_url = urls[0]
+
+    # Scan sensitive files once per domain
+    all_findings.extend(scan_sensitive_files(base_url, sess))
+
+    # Scan each URL
+    for url in urls:
+        try:
+            resp = sess.get(
+                url,
+                headers=get_headers(),
+                timeout=10,
+                verify=False
+            )
+            html = resp.text
+
+            all_findings.extend(scan_page_content(url, html))
+            all_findings.extend(scan_response_headers(url, sess))
+            all_findings.extend(scan_comments(url, html))
+
+        except requests.RequestException:
+            continue
+
+    return all_findings
+
+
+def _get_severity(pattern_name: str) -> str:
+    """Map pattern name to severity level."""
+    critical = ["AWS Secret Key", "Private Key Block", "Credit Card",
+                "Social Security Number", "GitHub Token", "JWT Token"]
+    high = ["AWS Access Key", "Google API Key", "Password in HTML",
+            "Basic Auth in URL", "Bearer Token", "API Key Generic"]
+    medium = ["SQL Error", "PHP Error", "Stack Trace",
+              "Internal Path", "Version Disclosure"]
+    low = ["Email Address", "Phone Number", "Debug Info", "IP Address"]
+
+    if pattern_name in critical:
+        return "Critical"
+    elif pattern_name in high:
+        return "High"
+    elif pattern_name in medium:
+        return "Medium"
+    elif pattern_name in low:
+        return "Low"
+    return "Info"
+
+
+def _file_severity(path: str) -> str:
+    """Map file path to severity level."""
+    critical_files = ["/.env", "/.git/config", "/wp-config.php",
+                      "/config.php", "/.ssh/id_rsa", "/.htpasswd",
+                      "/backup.sql", "/dump.sql", "/db.sql"]
+    high_files = ["/phpinfo.php", "/info.php", "/web.config",
+                  "/settings.py", "/database.yml", "/secrets.yml"]
+
+    if any(path.startswith(f) or path == f for f in critical_files):
+        return "Critical"
+    elif any(path.startswith(f) or path == f for f in high_files):
+        return "High"
+    return "Medium"
