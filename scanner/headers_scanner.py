@@ -1,179 +1,207 @@
+from .utils import Utils
+import logging
+
+logger = logging.getLogger(__name__)
+
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": {
+        "description": "Enforces secure (HTTPS) connections to the server.",
+        "severity": "High",
+        "recommendation": "Add 'Strict-Transport-Security: max-age=31536000; includeSubDomains; preload'",
+    },
+    "Content-Security-Policy": {
+        "description": "Prevents XSS and data injection attacks.",
+        "severity": "High",
+        "recommendation": "Implement a strict Content-Security-Policy header.",
+    },
+    "X-Frame-Options": {
+        "description": "Protects against clickjacking attacks.",
+        "severity": "Medium",
+        "recommendation": "Add 'X-Frame-Options: DENY' or 'X-Frame-Options: SAMEORIGIN'",
+    },
+    "X-Content-Type-Options": {
+        "description": "Prevents MIME type sniffing.",
+        "severity": "Medium",
+        "recommendation": "Add 'X-Content-Type-Options: nosniff'",
+    },
+    "Referrer-Policy": {
+        "description": "Controls referrer information sent with requests.",
+        "severity": "Low",
+        "recommendation": "Add 'Referrer-Policy: strict-origin-when-cross-origin'",
+    },
+    "Permissions-Policy": {
+        "description": "Controls browser features and APIs.",
+        "severity": "Low",
+        "recommendation": "Implement Permissions-Policy to restrict unnecessary browser features.",
+    },
+    "X-XSS-Protection": {
+        "description": "Legacy XSS filter (deprecated but still checked).",
+        "severity": "Low",
+        "recommendation": "Add 'X-XSS-Protection: 1; mode=block' for legacy browser support.",
+    },
+    "Cache-Control": {
+        "description": "Controls caching behavior.",
+        "severity": "Low",
+        "recommendation": "Add appropriate Cache-Control headers for sensitive pages.",
+    },
+}
+
+INSECURE_HEADERS = {
+    "Server": {
+        "description": "Reveals server software information.",
+        "severity": "Low",
+        "recommendation": "Remove or obscure the Server header to prevent information disclosure.",
+    },
+    "X-Powered-By": {
+        "description": "Reveals technology stack information.",
+        "severity": "Low",
+        "recommendation": "Remove the X-Powered-By header.",
+    },
+    "X-AspNet-Version": {
+        "description": "Reveals ASP.NET version information.",
+        "severity": "Low",
+        "recommendation": "Remove the X-AspNet-Version header.",
+    },
+    "X-AspNetMvc-Version": {
+        "description": "Reveals ASP.NET MVC version.",
+        "severity": "Low",
+        "recommendation": "Remove the X-AspNetMvc-Version header.",
+    },
+}
+
+
 class HeadersScanner:
-    def __init__(self):
-        self.security_headers = {
-            'Strict-Transport-Security': {
-                'description': 'HTTP Strict Transport Security (HSTS)',
-                'severity': 'HIGH',
-                'recommendation': 'Add: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload'
-            },
-            'Content-Security-Policy': {
-                'description': 'Content Security Policy (CSP)',
-                'severity': 'HIGH',
-                'recommendation': "Add: Content-Security-Policy: default-src 'self'; script-src 'self'"
-            },
-            'X-Frame-Options': {
-                'description': 'Clickjacking Protection',
-                'severity': 'MEDIUM',
-                'recommendation': 'Add: X-Frame-Options: DENY or SAMEORIGIN'
-            },
-            'X-Content-Type-Options': {
-                'description': 'MIME Type Sniffing Protection',
-                'severity': 'MEDIUM',
-                'recommendation': 'Add: X-Content-Type-Options: nosniff'
-            },
-            'X-XSS-Protection': {
-                'description': 'XSS Filter (Legacy)',
-                'severity': 'LOW',
-                'recommendation': 'Add: X-XSS-Protection: 1; mode=block'
-            },
-            'Referrer-Policy': {
-                'description': 'Referrer Information Control',
-                'severity': 'LOW',
-                'recommendation': 'Add: Referrer-Policy: strict-origin-when-cross-origin'
-            },
-            'Permissions-Policy': {
-                'description': 'Browser Features Control',
-                'severity': 'LOW',
-                'recommendation': 'Add: Permissions-Policy: geolocation=(), microphone=(), camera=()'
-            },
-            'Cache-Control': {
-                'description': 'Cache Control for Sensitive Pages',
-                'severity': 'LOW',
-                'recommendation': 'Add: Cache-Control: no-store, no-cache, must-revalidate'
-            },
-        }
+    def __init__(self, utils: Utils):
+        self.utils = utils
+        self.findings = []
 
-    def scan(self, crawl_data, progress_callback=None):
-        results = {
-            'missing_headers': [],
-            'misconfigured_headers': [],
-            'information_headers': [],
-            'cookie_issues': []
-        }
+    def scan(self, progress_callback=None) -> list:
+        if progress_callback:
+            progress_callback("Scanning security headers...")
 
-        # Check main page headers
-        for url, headers in crawl_data.get('response_headers', {}).items():
-            if progress_callback:
-                progress_callback(f"Analyzing headers for: {url}")
+        response = self.utils.get(self.utils.target_url)
+        if not response:
+            return []
 
-            # Check missing security headers
-            for header_name, header_info in self.security_headers.items():
-                if header_name not in headers:
-                    results['missing_headers'].append({
-                        'type': f'Missing Security Header: {header_name}',
-                        'severity': header_info['severity'],
-                        'url': url,
-                        'header': header_name,
-                        'description': f"{header_info['description']} header is missing",
-                        'recommendation': header_info['recommendation']
-                    })
+        headers = {k.lower(): v for k, v in response.headers.items()}
+        self._check_missing_headers(headers, response.url)
+        self._check_insecure_headers(response.headers, response.url)
+        self._check_cookie_security(response, response.url)
+        self._check_cors(response.headers, response.url)
+        return self.findings
 
-            # Check for misconfigured headers
-            misconfigs = self._check_misconfigurations(url, headers)
-            results['misconfigured_headers'].extend(misconfigs)
+    def _check_missing_headers(self, headers: dict, url: str):
+        for header, info in SECURITY_HEADERS.items():
+            if header.lower() not in headers:
+                self.findings.append(
+                    self.utils.create_finding(
+                        vuln_type="Missing Security Header",
+                        severity=info["severity"],
+                        title=f"Missing Header: {header}",
+                        description=info["description"],
+                        url=url,
+                        evidence=f"Header '{header}' not found in response",
+                        recommendation=info["recommendation"],
+                    )
+                )
+            else:
+                self._validate_header_value(
+                    header, headers[header.lower()], url
+                )
 
-            # Check for information disclosure headers
-            info_headers = self._check_info_headers(url, headers)
-            results['information_headers'].extend(info_headers)
+    def _validate_header_value(self, header: str, value: str, url: str):
+        if header == "Strict-Transport-Security":
+            if "max-age" not in value.lower():
+                self.findings.append(
+                    self.utils.create_finding(
+                        vuln_type="Misconfigured Header",
+                        severity="Medium",
+                        title="Weak HSTS Configuration",
+                        description="HSTS header is present but may be misconfigured.",
+                        url=url,
+                        evidence=f"Strict-Transport-Security: {value}",
+                        recommendation="Ensure max-age is set to at least 31536000.",
+                    )
+                )
+        elif header == "X-Frame-Options":
+            if value.upper() not in ["DENY", "SAMEORIGIN"]:
+                self.findings.append(
+                    self.utils.create_finding(
+                        vuln_type="Misconfigured Header",
+                        severity="Medium",
+                        title="Weak X-Frame-Options Configuration",
+                        description="X-Frame-Options has an invalid or weak value.",
+                        url=url,
+                        evidence=f"X-Frame-Options: {value}",
+                        recommendation="Use 'DENY' or 'SAMEORIGIN'.",
+                    )
+                )
+        elif header == "Content-Security-Policy":
+            weak_directives = ["unsafe-inline", "unsafe-eval", "*"]
+            for directive in weak_directives:
+                if directive in value:
+                    self.findings.append(
+                        self.utils.create_finding(
+                            vuln_type="Misconfigured Header",
+                            severity="Medium",
+                            title="Weak Content-Security-Policy",
+                            description=f"CSP contains potentially unsafe directive: {directive}",
+                            url=url,
+                            evidence=f"Content-Security-Policy: {value}",
+                            recommendation="Avoid using unsafe-inline, unsafe-eval, or wildcard (*) in CSP.",
+                        )
+                    )
+                    break
 
-        # Check cookie security
-        for cookie_name, cookie_value in crawl_data.get('cookies', {}).items():
-            cookie_issues = self._check_cookie_security(cookie_name, cookie_value)
-            results['cookie_issues'].extend(cookie_issues)
-
-        return results
-
-    def _check_misconfigurations(self, url, headers):
-        issues = []
-
-        # Check CSP for unsafe directives
-        if 'Content-Security-Policy' in headers:
-            csp = headers['Content-Security-Policy']
-            unsafe_patterns = [
-                ("'unsafe-inline'", "CSP allows unsafe-inline scripts", 'HIGH'),
-                ("'unsafe-eval'", "CSP allows unsafe-eval", 'HIGH'),
-                ("*", "CSP uses wildcard source", 'MEDIUM'),
-                ("data:", "CSP allows data: URIs", 'MEDIUM'),
-            ]
-            for pattern, desc, severity in unsafe_patterns:
-                if pattern in csp:
-                    issues.append({
-                        'type': 'Weak CSP Directive',
-                        'severity': severity,
-                        'url': url,
-                        'header': 'Content-Security-Policy',
-                        'value': csp[:200],
-                        'issue': pattern,
-                        'description': desc,
-                        'recommendation': f"Remove '{pattern}' from CSP"
-                    })
-
-        # Check HSTS configuration
-        if 'Strict-Transport-Security' in headers:
-            hsts = headers['Strict-Transport-Security']
-            if 'max-age' in hsts:
-                import re
-                max_age_match = re.search(r'max-age=(\d+)', hsts)
-                if max_age_match:
-                    max_age = int(max_age_match.group(1))
-                    if max_age < 31536000:  # Less than 1 year
-                        issues.append({
-                            'type': 'Weak HSTS Configuration',
-                            'severity': 'MEDIUM',
-                            'url': url,
-                            'header': 'Strict-Transport-Security',
-                            'value': hsts,
-                            'description': f'HSTS max-age is too short: {max_age}s',
-                            'recommendation': 'Set max-age to at least 31536000 (1 year)'
-                        })
-
-        # Check CORS
-        if 'Access-Control-Allow-Origin' in headers:
-            cors = headers['Access-Control-Allow-Origin']
-            if cors == '*':
-                issues.append({
-                    'type': 'Permissive CORS',
-                    'severity': 'HIGH',
-                    'url': url,
-                    'header': 'Access-Control-Allow-Origin',
-                    'value': cors,
-                    'description': 'CORS allows all origins (*)',
-                    'recommendation': 'Restrict CORS to specific trusted origins'
-                })
-
-        return issues
-
-    def _check_info_headers(self, url, headers):
-        info_issues = []
-
-        disclosure_headers = ['Server', 'X-Powered-By', 'X-AspNet-Version',
-                             'X-Generator', 'Via', 'X-Backend-Server']
-
-        for header in disclosure_headers:
+    def _check_insecure_headers(self, headers: dict, url: str):
+        for header, info in INSECURE_HEADERS.items():
             if header in headers:
-                info_issues.append({
-                    'type': 'Information Disclosure Header',
-                    'severity': 'LOW',
-                    'url': url,
-                    'header': header,
-                    'value': headers[header],
-                    'description': f"Header '{header}' discloses server information",
-                    'recommendation': f"Remove or obscure the '{header}' header"
-                })
+                self.findings.append(
+                    self.utils.create_finding(
+                        vuln_type="Information Disclosure Header",
+                        severity=info["severity"],
+                        title=f"Information Disclosure: {header}",
+                        description=info["description"],
+                        url=url,
+                        evidence=f"{header}: {headers[header]}",
+                        recommendation=info["recommendation"],
+                    )
+                )
 
-        return info_issues
+    def _check_cookie_security(self, response, url: str):
+        for cookie in response.cookies:
+            issues = []
+            if not cookie.secure:
+                issues.append("missing Secure flag")
+            if not cookie.has_nonstandard_attr("HttpOnly"):
+                issues.append("missing HttpOnly flag")
+            if not cookie.has_nonstandard_attr("SameSite"):
+                issues.append("missing SameSite attribute")
 
-    def _check_cookie_security(self, name, value):
-        issues = []
-        sensitive_names = ['session', 'auth', 'token', 'user', 'sid', 'login']
+            if issues:
+                self.findings.append(
+                    self.utils.create_finding(
+                        vuln_type="Insecure Cookie",
+                        severity="Medium",
+                        title=f"Insecure Cookie: {cookie.name}",
+                        description=f"Cookie '{cookie.name}' has security issues: {', '.join(issues)}",
+                        url=url,
+                        evidence=f"Cookie: {cookie.name}={cookie.value[:20]}...",
+                        recommendation="Set Secure, HttpOnly, and SameSite=Strict flags on all cookies.",
+                    )
+                )
 
-        if any(s in name.lower() for s in sensitive_names):
-            issues.append({
-                'type': 'Cookie Security Check',
-                'severity': 'MEDIUM',
-                'cookie_name': name,
-                'description': f"Session cookie '{name}' - verify HttpOnly, Secure, and SameSite flags",
-                'recommendation': 'Set HttpOnly=true, Secure=true, SameSite=Strict on session cookies'
-            })
-
-        return issues
+    def _check_cors(self, headers: dict, url: str):
+        acao = headers.get("Access-Control-Allow-Origin", "")
+        if acao == "*":
+            self.findings.append(
+                self.utils.create_finding(
+                    vuln_type="CORS Misconfiguration",
+                    severity="High",
+                    title="Wildcard CORS Policy",
+                    description="The server allows requests from any origin (*).",
+                    url=url,
+                    evidence=f"Access-Control-Allow-Origin: {acao}",
+                    recommendation="Restrict CORS to specific trusted origins.",
+                )
+            )
