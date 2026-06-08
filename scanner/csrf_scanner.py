@@ -1,121 +1,202 @@
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from .utils import Utils
+import logging
 import re
-from .utils import safe_request
+
+logger = logging.getLogger(__name__)
+
+CSRF_TOKEN_NAMES = [
+    "csrf", "csrftoken", "csrf_token", "_csrf", "xsrf",
+    "xsrftoken", "_token", "authenticity_token",
+    "csrfmiddlewaretoken", "requestverificationtoken",
+    "__requestverificationtoken", "antiforgery",
+]
+
 
 class CSRFScanner:
-    def __init__(self):
-        self.vulnerabilities = []
+    def __init__(self, utils: Utils, forms: list = None):
+        self.utils = utils
+        self.forms = forms or []
+        self.findings = []
 
-    def scan(self, crawl_data, progress_callback=None):
-        results = {
-            'missing_csrf_token': [],
-            'weak_csrf_token': [],
-            'missing_samesite': [],
-            'vulnerable_forms': []
-        }
+    def scan(self, progress_callback=None) -> list:
+        if progress_callback:
+            progress_callback("Scanning for CSRF vulnerabilities...")
 
-        # Analyze forms for CSRF
-        for form in crawl_data.get('forms', []):
+        self._scan_forms(progress_callback)
+        self._check_samesite_cookies(progress_callback)
+        self._check_custom_headers(progress_callback)
+        return self.findings
+
+    def _scan_forms(self, progress_callback=None):
+        post_forms = [f for f in self.forms if f.get("method") == "post"]
+
+        if not post_forms:
             if progress_callback:
-                progress_callback(f"CSRF scanning form: {form['action']}")
+                progress_callback("No POST forms found for CSRF testing.")
+            return
 
-            if form['method'] == 'POST':
-                vuln = self._analyze_form_csrf(form)
-                if vuln:
-                    results['missing_csrf_token'].append(vuln)
+        for form in post_forms:
+            if progress_callback:
+                progress_callback(f"Checking CSRF protection in form at: {form.get('url', '')}")
 
-        # Analyze cookies for SameSite
-        for cookie_name, cookie_value in crawl_data.get('cookies', {}).items():
-            cookie_vuln = self._analyze_cookie(cookie_name, cookie_value)
-            if cookie_vuln:
-                results['missing_samesite'].append(cookie_vuln)
+            has_csrf = form.get("has_csrf_token", False)
 
-        # Check response headers
-        for url, headers in crawl_data.get('response_headers', {}).items():
-            header_vulns = self._analyze_headers_csrf(url, headers)
-            results['missing_samesite'].extend(header_vulns)
+            if not has_csrf:
+                has_csrf = self._check_inputs_for_csrf(form.get("inputs", []))
 
-        return results
+            if not has_csrf:
+                has_csrf = self._check_meta_csrf(form.get("url", ""))
 
-    def _analyze_form_csrf(self, form):
-        if not form['has_csrf_token']:
-            # Check if it's a sensitive form
-            sensitive_inputs = ['password', 'email', 'username', 'user', 'login',
-                              'register', 'transfer', 'amount', 'payment', 'delete',
-                              'update', 'edit', 'admin', 'account']
+            if not has_csrf:
+                self.findings.append(
+                    self.utils.create_finding(
+                        vuln_type="CSRF",
+                        severity="High",
+                        title="Missing CSRF Protection",
+                        description=(
+                            "A POST form was found without CSRF token protection. "
+                            "This could allow attackers to perform unauthorized actions on behalf of users."
+                        ),
+                        url=form.get("url", self.utils.target_url),
+                        evidence=(
+                            f"Form action: {form.get('action', 'N/A')}, "
+                            f"Method: {form.get('method', 'N/A')}, "
+                            f"No CSRF token found in inputs"
+                        ),
+                        recommendation=(
+                            "Implement CSRF tokens in all state-changing forms. "
+                            "Use the SameSite cookie attribute and verify Origin/Referer headers."
+                        ),
+                    )
+                )
+            else:
+                self._check_csrf_token_strength(form)
 
-            form_inputs_str = ' '.join([i['name'].lower() for i in form['inputs']])
-            form_action_str = form['action'].lower()
-
-            is_sensitive = any(s in form_inputs_str or s in form_action_str 
-                             for s in sensitive_inputs)
-
-            severity = 'HIGH' if is_sensitive else 'MEDIUM'
-
-            return {
-                'type': 'Missing CSRF Token',
-                'severity': severity,
-                'url': form['action'],
-                'method': form['method'],
-                'form_inputs': [i['name'] for i in form['inputs'] if i['name']],
-                'is_sensitive': is_sensitive,
-                'description': f"POST form at {form['action']} lacks CSRF protection",
-                'recommendation': 'Add CSRF token to all state-changing forms'
-            }
-        else:
-            # Check for weak CSRF tokens
-            for input_field in form['inputs']:
-                if any(t in input_field['name'].lower() for t in ['csrf', 'token', 'nonce']):
-                    token_value = input_field.get('value', '')
-                    if token_value and self._is_weak_token(token_value):
-                        return {
-                            'type': 'Weak CSRF Token',
-                            'severity': 'MEDIUM',
-                            'url': form['action'],
-                            'token_name': input_field['name'],
-                            'token_value': token_value[:20] + '...',
-                            'description': 'CSRF token appears to be weak or predictable',
-                            'recommendation': 'Use cryptographically secure random tokens'
-                        }
-        return None
-
-    def _is_weak_token(self, token):
-        # Check if token is too short
-        if len(token) < 16:
-            return True
-        # Check if token is sequential or simple
-        if re.match(r'^[0-9]+$', token):
-            return True
-        # Check if token is common weak value
-        weak_tokens = ['undefined', 'null', 'true', 'false', '0', '1', 'token']
-        if token.lower() in weak_tokens:
-            return True
+    def _check_inputs_for_csrf(self, inputs: list) -> bool:
+        for inp in inputs:
+            name = inp.get("name", "").lower()
+            inp_id = inp.get("id", "").lower()
+            if any(token in name for token in CSRF_TOKEN_NAMES):
+                return True
+            if any(token in inp_id for token in CSRF_TOKEN_NAMES):
+                return True
         return False
 
-    def _analyze_cookie(self, name, value):
-        sensitive_names = ['session', 'auth', 'token', 'user', 'login', 'sid', 'ssid']
-        if any(s in name.lower() for s in sensitive_names):
-            return {
-                'type': 'Cookie Missing SameSite',
-                'severity': 'MEDIUM',
-                'cookie_name': name,
-                'description': f"Session cookie '{name}' may be missing SameSite attribute",
-                'recommendation': 'Set SameSite=Strict or SameSite=Lax on session cookies'
-            }
-        return None
+    def _check_meta_csrf(self, url: str) -> bool:
+        response = self.utils.get(url or self.utils.target_url)
+        if not response:
+            return False
 
-    def _analyze_headers_csrf(self, url, headers):
-        vulnerabilities = []
+        soup = BeautifulSoup(response.text, "lxml")
+        for meta in soup.find_all("meta"):
+            name = meta.get("name", "").lower()
+            if any(token in name for token in CSRF_TOKEN_NAMES):
+                return True
 
-        # Check for missing CORS headers that could enable CSRF
-        if 'Access-Control-Allow-Origin' in headers:
-            if headers['Access-Control-Allow-Origin'] == '*':
-                vulnerabilities.append({
-                    'type': 'Permissive CORS Policy',
-                    'severity': 'HIGH',
-                    'url': url,
-                    'header': 'Access-Control-Allow-Origin: *',
-                    'description': 'Wildcard CORS policy allows any origin to make requests',
-                    'recommendation': 'Restrict CORS to specific trusted origins'
-                })
+        for header_name in response.headers:
+            if any(token in header_name.lower() for token in CSRF_TOKEN_NAMES):
+                return True
 
-        return vulnerabilities
+        return False
+
+    def _check_csrf_token_strength(self, form: dict):
+        for inp in form.get("inputs", []):
+            name = inp.get("name", "").lower()
+            if any(token in name for token in CSRF_TOKEN_NAMES):
+                value = inp.get("value", "")
+                if len(value) < 16:
+                    self.findings.append(
+                        self.utils.create_finding(
+                            vuln_type="CSRF",
+                            severity="Medium",
+                            title="Weak CSRF Token",
+                            description="CSRF token appears to be too short or weak.",
+                            url=form.get("url", self.utils.target_url),
+                            evidence=f"Token length: {len(value)} characters",
+                            recommendation="Use cryptographically secure random tokens of at least 32 characters.",
+                        )
+                    )
+                if value and self._is_predictable(value):
+                    self.findings.append(
+                        self.utils.create_finding(
+                            vuln_type="CSRF",
+                            severity="High",
+                            title="Predictable CSRF Token",
+                            description="CSRF token appears to be predictable or sequential.",
+                            url=form.get("url", self.utils.target_url),
+                            evidence=f"Token value: {value[:20]}...",
+                            recommendation="Use cryptographically secure random token generation.",
+                        )
+                    )
+
+    def _is_predictable(self, token: str) -> bool:
+        if token.isdigit():
+            return True
+        if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                    token, re.IGNORECASE):
+            return False
+        sequential_patterns = [
+            r"^(0+)$",
+            r"^(1+)$",
+            r"^(123)+$",
+            r"^(abc)+$",
+        ]
+        for pattern in sequential_patterns:
+            if re.match(pattern, token, re.IGNORECASE):
+                return True
+        return False
+
+    def _check_samesite_cookies(self, progress_callback=None):
+        if progress_callback:
+            progress_callback("Checking SameSite cookie attributes...")
+
+        response = self.utils.get(self.utils.target_url)
+        if not response:
+            return
+
+        for cookie in response.cookies:
+            samesite = cookie._rest.get("SameSite", "").lower() if hasattr(cookie, "_rest") else ""
+            if not samesite:
+                self.findings.append(
+                    self.utils.create_finding(
+                        vuln_type="CSRF",
+                        severity="Medium",
+                        title=f"Cookie Missing SameSite Attribute: {cookie.name}",
+                        description=(
+                            f"Cookie '{cookie.name}' does not have the SameSite attribute, "
+                            "which helps prevent CSRF attacks."
+                        ),
+                        url=self.utils.target_url,
+                        evidence=f"Cookie: {cookie.name}",
+                        recommendation="Set SameSite=Strict or SameSite=Lax on all cookies.",
+                    )
+                )
+
+    def _check_custom_headers(self, progress_callback=None):
+        if progress_callback:
+            progress_callback("Checking CSRF header protections...")
+
+        response = self.utils.get(self.utils.target_url)
+        if not response:
+            return
+
+        headers = {k.lower(): v for k, v in response.headers.items()}
+        has_protection = (
+            "x-frame-options" in headers
+            or "content-security-policy" in headers
+        )
+
+        if not has_protection:
+            self.findings.append(
+                self.utils.create_finding(
+                    vuln_type="CSRF",
+                    severity="Low",
+                    title="No Additional CSRF Header Protections",
+                    description="No X-Frame-Options or CSP headers found that could help prevent CSRF.",
+                    url=self.utils.target_url,
+                    evidence="Missing X-Frame-Options and Content-Security-Policy headers",
+                    recommendation="Implement X-Frame-Options and Content-Security-Policy headers as defense-in-depth.",
+                )
+            )
